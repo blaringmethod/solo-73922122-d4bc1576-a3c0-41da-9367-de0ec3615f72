@@ -17,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine
+from .graph_cache import graph_cache
 from .models import (DOC_REGISTERED, DOC_WITHDRAWN, ENTRY_ACTIVE,
                      ENTRY_WITHDRAWN, V_CONFIRMED, V_INFLIGHT, V_INSUFFICIENT,
                      V_RETURNED, V_STALE, Citation, Document, Entry, Matter,
@@ -137,8 +138,12 @@ def get_matter_or_404(session: Session, matter_id: int) -> Matter:
     return m
 
 
-def mark_matter_changed(session: Session, matter_id: int):
-    """本事项资料变动（同事务内）：版本+1；旧结论置为待复核；在途核查退回。"""
+def mark_matter_changed(session: Session, matter_id: int) -> int:
+    """本事项资料变动（同事务内）：版本原子+1；旧结论置待复核；在途核查退回。
+
+    返回该事务提交后将生效的新版本号（原子 ``version = version + 1``，
+    并发改录也不会丢版本），供提交成功后发布增量补丁使用。
+    """
     now = datetime.utcnow()
     session.query(Matter).filter(Matter.id == matter_id).update(
         {"version": Matter.version + 1}, synchronize_session=False
@@ -151,6 +156,9 @@ def mark_matter_changed(session: Session, matter_id: int):
         Verification.matter_id == matter_id,
         Verification.status == V_INFLIGHT,
     ).update({"status": V_RETURNED, "updated_at": now}, synchronize_session=False)
+    # 本事务内即可读到上面原子自增后的值；提交失败则随事务回滚，版本号不作数
+    new_version = session.query(Matter.version).filter(Matter.id == matter_id).scalar()
+    return int(new_version)
 
 
 def _add_citation(session: Session, matter_id: int, from_entry_id: int,
@@ -192,7 +200,8 @@ def root():
         "service": "街道更名佐证核查 API",
         "docs": "/docs",
         "endpoints": ["/matters", "/matters/{id}/documents", "/matters/{id}/entries",
-                      "/matters/{id}/verifications", "/verifications/{id}"],
+                      "/matters/{id}/verifications", "/verifications/{id}",
+                      "/debug/graph-cache"],
     }
 
 
@@ -253,7 +262,10 @@ def register_document(matter_id: int, body: DocumentCreate, session: Session = D
             session.add(doc)
             session.flush()
         mark_matter_changed(session, matter_id)
-        return document_out(doc)
+        payload = document_out(doc)
+    # 档号资料变动不属于「只有改录引用」：提交成功后令增量图失效，下次整图读库
+    graph_cache.invalidate(matter_id)
+    return payload
 
 
 @app.delete("/matters/{matter_id}/documents/{archive_no}", summary="撤回原件档号")
@@ -268,7 +280,9 @@ def withdraw_document(matter_id: int, archive_no: str, session: Session = Depend
         doc.status = DOC_WITHDRAWN
         doc.updated_at = datetime.utcnow()
         mark_matter_changed(session, matter_id)
-        return document_out(doc)
+        payload = document_out(doc)
+    graph_cache.invalidate(matter_id)
+    return payload
 
 
 # ---------- 转引条目与引用 ----------
@@ -283,7 +297,10 @@ def add_entry(matter_id: int, body: EntryCreate, session: Session = Depends(get_
         for t in body.citations:
             _add_citation(session, matter_id, e.id, t)
         mark_matter_changed(session, matter_id)
-        return entry_out(session, e)
+        payload = entry_out(session, e)
+    # 新条目属于其他资料变动：提交成功后失效整图缓存
+    graph_cache.invalidate(matter_id)
+    return payload
 
 
 @app.delete("/matters/{matter_id}/entries/{entry_id}", summary="撤回转引条目")
@@ -296,7 +313,9 @@ def withdraw_entry(matter_id: int, entry_id: int, session: Session = Depends(get
         e.status = ENTRY_WITHDRAWN
         e.updated_at = datetime.utcnow()
         mark_matter_changed(session, matter_id)
-        return entry_out(session, e)
+        payload = entry_out(session, e)
+    graph_cache.invalidate(matter_id)
+    return payload
 
 
 @app.put("/matters/{matter_id}/entries/{entry_id}/citations", summary="改录引用（整体替换该条目的引用）")
@@ -310,10 +329,19 @@ def update_citations(matter_id: int, entry_id: int, body: CitationsUpdate,
         session.query(Citation).filter(Citation.from_entry_id == entry_id).delete(
             synchronize_session=False
         )
+        new_edges = []
         for t in body.citations:
-            _add_citation(session, matter_id, entry_id, t)
-        mark_matter_changed(session, matter_id)
-        return entry_out(session, e)
+            c = _add_citation(session, matter_id, entry_id, t)
+            # 记录本次改录提交后的完整出边，供进程内图缓存增量合入
+            if c.to_entry_id is not None:
+                new_edges.append(("entry", c.to_entry_id))
+            else:
+                new_edges.append(("document", c.to_document_id))
+        new_version = mark_matter_changed(session, matter_id)
+        payload = entry_out(session, e)
+    # 仅当事务成功提交后才发布补丁；校验/提交失败时不会走到这里，原图与缓存不变
+    graph_cache.record_citation_change(matter_id, new_version, entry_id, new_edges)
+    return payload
 
 
 # ---------- 核查 ----------
@@ -323,12 +351,23 @@ def update_citations(matter_id: int, entry_id: int, body: CitationsUpdate,
 def start_verification(matter_id: int, body: VerificationCreate, request: Request,
                        wait: bool = Query(False, description="是否等待核查完成后返回"),
                        session: Session = Depends(get_session)):
-    get_matter_or_404(session, matter_id)
-    e = session.get(Entry, body.entry_id)
-    if e is None or e.matter_id != matter_id or e.status != ENTRY_ACTIVE:
-        raise HTTPException(status_code=404, detail="起点条目不存在或已撤回")
+    m = get_matter_or_404(session, matter_id)
+    # 热缓存时直接用与 m.version 同状态的在录条目集合校验起点，
+    # 跳过对未变 entries 行的重复读取；缓存不能精确复原时回退到查库。
+    try:
+        cached = graph_cache.try_build(matter_id, m.version, m.created_at, count=False)
+    except Exception:  # noqa: BLE001 - 缓存探测失败不影响接口
+        cached = None
+    if cached is not None:
+        if body.entry_id not in cached[0]:
+            raise HTTPException(status_code=404, detail="起点条目不存在或已撤回")
+    else:
+        e = session.get(Entry, body.entry_id)
+        if e is None or e.matter_id != matter_id or e.status != ENTRY_ACTIVE:
+            raise HTTPException(status_code=404, detail="起点条目不存在或已撤回")
     with txn(session):
-        v = Verification(matter_id=matter_id, start_entry_id=e.id, status=V_INFLIGHT)
+        v = Verification(matter_id=matter_id, start_entry_id=body.entry_id,
+                         status=V_INFLIGHT)
         session.add(v)
         session.flush()
         vid = v.id
@@ -339,6 +378,15 @@ def start_verification(matter_id: int, body: VerificationCreate, request: Reques
         t.join(timeout=max(10.0, delay + 10.0))
     session.expire_all()
     return verification_out(session.get(Verification, vid))
+
+
+@app.get("/debug/graph-cache", tags=["调试"],
+         summary="进程内核查取图缓存状态（演示增量复用/失效/重启清空）")
+def graph_cache_info(matter_id: Optional[int] = Query(None, description="只看指定事项")):
+    info = graph_cache.info()
+    if matter_id is not None:
+        info["matters"] = [x for x in info["matters"] if x["matter_id"] == matter_id]
+    return info
 
 
 @app.get("/matters/{matter_id}/verifications", summary="查询本事项的核查结论（可按起点条目、状态过滤）")
